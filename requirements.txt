@@ -1,0 +1,6 @@
+streamlit
+akshare
+numpy
+pandas
+scipy
+matplotlib
