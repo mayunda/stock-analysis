@@ -6,7 +6,6 @@ from scipy.signal import savgol_filter
 from datetime import datetime, timedelta
 import time
 import matplotlib.pyplot as plt
-
 import matplotlib.font_manager as fm
 
 font_path = "fonts/SimHei.ttf"
@@ -17,6 +16,20 @@ plt.rcParams['axes.unicode_minus'] = False
 window_length = 11
 polyorder = 3
 STOP_LOSS_PERCENT = 8.0
+
+
+def get_stock_name(stock_code):
+    """
+    根据股票代码查询股票名称
+    """
+    try:
+        info_df = ak.stock_individual_info_em(symbol=stock_code)
+        name_row = info_df[info_df["item"] == "股票简称"]
+        if not name_row.empty:
+            return name_row["value"].values[0]
+        return None
+    except Exception:
+        return None
 
 
 def get_stock_data_with_retry(stock_code, start_date, end_date, max_retries=3):
@@ -39,11 +52,11 @@ def get_stock_data_with_retry(stock_code, start_date, end_date, max_retries=3):
 
 def judge_signal(prev_first, latest_first, latest_second):
     if prev_first < 0 and latest_first > 0:
-        return "潜在买入信号：一阶导数由负转正，短期趋势可能由跌转涨", "success"
+        return "潜在买入信号：动量由负转正，短期趋势可能由跌转涨", "success"
     elif latest_first > 0 and latest_second < 0:
-        return "注意：价格仍在上涨，但二阶导数转负，上涨动能可能正在减弱", "warning"
+        return "注意：价格仍在上涨，但曲率转负，上涨动能可能正在减弱", "warning"
     elif latest_first < 0:
-        return "无买入信号：当前一阶导数为负，价格仍处于下跌趋势", "error"
+        return "无买入信号：当前动量为负，价格仍处于下跌趋势", "error"
     else:
         return "观察中：暂无明显的拐点信号", "info"
 
@@ -82,7 +95,7 @@ def check_stop_loss(entry_price, current_price, latest_second_deriv):
         messages.append((f"当前浮盈 {-loss_percent:.2f}%，暂无亏损", "success"))
 
     if latest_second_deriv < 0:
-        messages.append(("预警：二阶导数为负，上涨/反弹动能正在减弱，建议提高警惕", "warning"))
+        messages.append(("预警：曲率为负，上涨/反弹动能正在减弱，建议提高警惕", "warning"))
 
     return messages
 
@@ -100,10 +113,10 @@ def show_message(text, level):
 
 # ========== 网页界面开始 ==========
 
-st.set_page_config(page_title="A股导数信号分析", layout="wide")
+st.set_page_config(page_title="A股动量曲率分析", layout="wide")
 
-st.title("A股K线导数分析工具")
-st.caption("基于一阶导（涨跌速度）、二阶导（涨跌加速度）与成交量的技术面参考工具，仅供学习研究使用，不构成投资建议")
+st.title("A股K线动量与曲率分析工具")
+st.caption("基于动量（价格变化速度）、曲率（价格变化的弯曲程度）与成交量的技术面参考工具，仅供学习研究使用，不构成投资建议")
 st.warning("⚠️ 免责声明：本工具基于历史价格数据的技术指标计算，仅用于技术学习交流，不构成任何投资建议。股市有风险，入市需谨慎，一切投资决策及后果由使用者自行承担。开发者不对因使用本工具产生的任何损失负责。")
 
 col1, col2 = st.columns(2)
@@ -119,6 +132,7 @@ if analyze_button:
         st.error("请输入正确的6位股票代码")
     else:
         with st.spinner("正在获取数据，请稍候..."):
+            stock_name = get_stock_name(stock_code)
             end_date = datetime.now().strftime("%Y%m%d")
             start_date = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
             df = get_stock_data_with_retry(stock_code, start_date, end_date)
@@ -140,7 +154,8 @@ if analyze_button:
             latest = df.iloc[-1]
             prev = df.iloc[-2]
 
-            st.subheader(f"{stock_code}　最新交易日: {latest['日期']}　最新收盘价: {latest['收盘']}")
+            display_name = f"{stock_name}（{stock_code}）" if stock_name else stock_code
+            st.subheader(f"{display_name}　最新交易日: {latest['日期']}　最新收盘价: {latest['收盘']}")
 
             # ----- 图表 -----
             fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
@@ -154,12 +169,12 @@ if analyze_button:
 
             axes[1].plot(dates, df["稳健_一阶导"].tail(60), color="green")
             axes[1].axhline(0, color="black", linewidth=0.8, linestyle="--")
-            axes[1].set_title("一阶导数（稳健版EMA）")
+            axes[1].set_title("动量（稳健版EMA）")
             axes[1].grid(True)
 
             axes[2].plot(dates, df["稳健_二阶导"].tail(60), color="red")
             axes[2].axhline(0, color="black", linewidth=0.8, linestyle="--")
-            axes[2].set_title("二阶导数（稳健版EMA）")
+            axes[2].set_title("曲率（稳健版EMA）")
             axes[2].grid(True)
 
             plt.xticks(rotation=45)
@@ -174,13 +189,13 @@ if analyze_button:
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown("**方法A：灵敏版 Savitzky-Golay**")
-                st.write(f"一阶导数: {latest['灵敏_一阶导']:.2f}　二阶导数: {latest['灵敏_二阶导']:.2f}")
+                st.write(f"动量: {latest['灵敏_一阶导']:.2f}　曲率: {latest['灵敏_二阶导']:.2f}")
                 msg_a, level_a = judge_signal(prev["灵敏_一阶导"], latest["灵敏_一阶导"], latest["灵敏_二阶导"])
                 show_message(msg_a, level_a)
 
             with c2:
                 st.markdown("**方法B：稳健版 EMA**")
-                st.write(f"一阶导数: {latest['稳健_一阶导']:.2f}　二阶导数: {latest['稳健_二阶导']:.2f}")
+                st.write(f"动量: {latest['稳健_一阶导']:.2f}　曲率: {latest['稳健_二阶导']:.2f}")
                 msg_b, level_b = judge_signal(prev["稳健_一阶导"], latest["稳健_一阶导"], latest["稳健_二阶导"])
                 show_message(msg_b, level_b)
 
@@ -205,4 +220,10 @@ if analyze_button:
 
             with st.expander("查看最近10天详细数据"):
                 display_cols = ["日期", "收盘", "成交量", "灵敏_一阶导", "灵敏_二阶导", "稳健_一阶导", "稳健_二阶导"]
-                st.dataframe(df[display_cols].tail(10), use_container_width=True)
+                display_df = df[display_cols].tail(10).rename(columns={
+                    "灵敏_一阶导": "灵敏_动量",
+                    "灵敏_二阶导": "灵敏_曲率",
+                    "稳健_一阶导": "稳健_动量",
+                    "稳健_二阶导": "稳健_曲率",
+                })
+                st.dataframe(display_df, use_container_width=True)
