@@ -7,6 +7,10 @@ from datetime import datetime, timedelta
 import time
 import matplotlib.pyplot as plt
 
+import matplotlib.font_manager as fm
+
+font_path = "fonts/SimHei.ttf"
+fm.fontManager.addfont(font_path)
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
