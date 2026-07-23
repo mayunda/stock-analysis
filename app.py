@@ -23,10 +23,10 @@ def get_stock_name(stock_code):
     根据股票代码查询股票名称
     """
     try:
-        info_df = ak.stock_individual_info_em(symbol=stock_code)
-        name_row = info_df[info_df["item"] == "股票简称"]
-        if not name_row.empty:
-            return name_row["value"].values[0]
+        name_df = ak.stock_info_a_code_name()
+        result = name_df[name_df["code"] == stock_code]
+        if not result.empty:
+            return result["name"].values[0]
         return None
     except Exception:
         return None
