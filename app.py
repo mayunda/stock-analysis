@@ -474,26 +474,37 @@ if analyze_button:
                 except ValueError:
                     entry_price = None
 
-            # ===== 结论1：技术面结论 =====
+            # ===== 结论1：技术面结论（自动显示，速度快）=====
             technical_conclusion, technical_level, technical_reasons = get_technical_conclusion(
                 prev["稳健_一阶导"], latest["稳健_一阶导"], latest["稳健_二阶导"], is_stop_loss_triggered
             )
 
-            # ===== 结论2：资金面结论 =====
-            with st.spinner("正在查询股东增减持与北向资金数据..."):
-                capital_conclusion, capital_level, capital_details = get_capital_conclusion(stock_code)
+            st.markdown("### 技术面结论（动量+曲率）")
+            render_conclusion_box("技术面结论", technical_conclusion, technical_level, "；".join(technical_reasons))
 
-            # ===== 结论3：综合结论 =====
-            overall_conclusion, overall_level, overall_reason = get_overall_conclusion(technical_conclusion, capital_conclusion)
+            # ===== 资金面结论：改为手动触发，避免拖慢默认分析速度 =====
+            st.markdown("### 资金面结论（可选，需单独查询）")
+            st.caption("股东增减持公告与北向资金查询耗时较长，默认不自动执行，点击下方按钮才会查询")
 
-            st.markdown("### 三大结论一览")
-            col_a, col_b, col_c = st.columns(3)
-            with col_a:
-                render_conclusion_box("技术面结论（动量+曲率）", technical_conclusion, technical_level, "；".join(technical_reasons))
-            with col_b:
-                render_conclusion_box("资金面结论（股东+北向资金）", capital_conclusion, capital_level, "；".join(capital_details))
-            with col_c:
-                render_conclusion_box("综合结论", overall_conclusion, overall_level, overall_reason)
+            capital_button = st.button("查询资金面数据（股东增减持 + 北向资金）", key=f"capital_btn_{stock_code}")
+
+            capital_cache_key = f"capital_result_{stock_code}"
+
+            if capital_button:
+                with st.spinner("正在查询股东增减持与北向资金数据，可能需要一些时间..."):
+                    capital_conclusion, capital_level, capital_details = get_capital_conclusion(stock_code)
+                    st.session_state[capital_cache_key] = (capital_conclusion, capital_level, capital_details)
+
+            if capital_cache_key in st.session_state:
+                capital_conclusion, capital_level, capital_details = st.session_state[capital_cache_key]
+
+                overall_conclusion, overall_level, overall_reason = get_overall_conclusion(technical_conclusion, capital_conclusion)
+
+                col_b, col_c = st.columns(2)
+                with col_b:
+                    render_conclusion_box("资金面结论（股东+北向资金）", capital_conclusion, capital_level, "；".join(capital_details))
+                with col_c:
+                    render_conclusion_box("综合结论", overall_conclusion, overall_level, overall_reason)
 
             st.caption("以上结论仅基于历史数据与公开信息的规则计算，不构成投资建议，最终决策请结合自身判断")
 
@@ -612,7 +623,7 @@ if analyze_button:
 
 st.markdown("---")
 st.markdown("## 批量监控")
-st.caption("一次输入多个股票代码（用英文逗号分隔），快速查看每只股票的核心信号摘要（含技术面、资金面综合结论）")
+st.caption("一次输入多个股票代码（用英文逗号分隔），快速查看每只股票的技术面（动量+曲率）信号摘要。资金面数据查询较慢，暂不包含在批量模式中，如需查看请到上方单只股票分析中单独查询")
 
 batch_input = st.text_area(
     "请输入多个股票代码，用英文逗号分隔，例如：600519,000858,601318",
@@ -641,7 +652,7 @@ if batch_button:
             if len(code) != 6:
                 results_table.append({
                     "代码": code, "名称": "-", "最新价": "-",
-                    "综合结论": "-", "技术面": "代码格式错误", "资金面": "-", "曲率": "-", "成交量": "-"
+                    "技术面结论": "代码格式错误", "曲率": "-", "成交量": "-"
                 })
                 progress_bar.progress((i + 1) / len(codes))
                 continue
@@ -654,7 +665,7 @@ if batch_button:
             if b_df is None or len(b_df) < 30:
                 results_table.append({
                     "代码": code, "名称": b_name if b_name else "-", "最新价": "-",
-                    "综合结论": "-", "技术面": "数据获取失败", "资金面": "-", "曲率": "-", "成交量": "-"
+                    "技术面结论": "数据获取失败", "曲率": "-", "成交量": "-"
                 })
                 progress_bar.progress((i + 1) / len(codes))
                 continue
@@ -671,8 +682,6 @@ if batch_button:
             b_technical, b_tech_level, _ = get_technical_conclusion(
                 b_prev["稳健_一阶导"], b_latest["稳健_一阶导"], b_latest["稳健_二阶导"]
             )
-            b_capital, b_capital_level, _ = get_capital_conclusion(code)
-            b_overall, b_overall_level, _ = get_overall_conclusion(b_technical, b_capital)
 
             b_vol_msg, b_vol_level = check_volume_confirmation(b_df)
             vol_short = "放量" if "放量" in b_vol_msg else ("缩量" if ("缩量" in b_vol_msg or "萎缩" in b_vol_msg) else "平稳")
@@ -684,9 +693,7 @@ if batch_button:
                 "代码": code,
                 "名称": b_name if b_name else "-",
                 "最新价": round(b_latest["收盘"], 2),
-                "综合结论": icon_map.get(b_overall, b_overall),
-                "技术面": icon_map.get(b_technical, b_technical),
-                "资金面": icon_map.get(b_capital, b_capital),
+                "技术面结论": icon_map.get(b_technical, b_technical),
                 "曲率": round(b_latest["稳健_二阶导"], 2),
                 "成交量": vol_short
             })
