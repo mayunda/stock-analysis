@@ -16,7 +16,9 @@ plt.rcParams['axes.unicode_minus'] = False
 
 window_length = 11
 polyorder = 3
-STOP_LOSS_PERCENT = 8.0
+
+ATR_PERIOD = 14
+ATR_MULTIPLIER = 2.5
 
 USERS_FILE = "users.json"
 
@@ -64,9 +66,6 @@ def login_page():
 # ========== 数据获取（含主备数据源切换）==========
 
 def get_stock_code_with_prefix(stock_code):
-    """
-    根据股票代码判断交易所前缀（沪市sh/深市sz），腾讯接口需要这个前缀
-    """
     if stock_code.startswith("6"):
         return "sh" + stock_code
     else:
@@ -74,9 +73,6 @@ def get_stock_code_with_prefix(stock_code):
 
 
 def get_data_from_eastmoney(stock_code, start_date, end_date):
-    """
-    主数据源：东方财富
-    """
     df = ak.stock_zh_a_hist(
         symbol=stock_code,
         period="daily",
@@ -88,10 +84,6 @@ def get_data_from_eastmoney(stock_code, start_date, end_date):
 
 
 def get_data_from_tencent(stock_code, start_date, end_date):
-    """
-    备用数据源：腾讯财经
-    返回的列名和东方财富不同，这里统一"翻译"成一样的格式
-    """
     prefixed_code = get_stock_code_with_prefix(stock_code)
     df = ak.stock_zh_a_hist_tx(symbol=prefixed_code)
 
@@ -179,14 +171,37 @@ def check_volume_confirmation(df):
             return f"成交量中性：价格下跌，量能变化不明显（{volume_ratio:.1f}倍）", "info"
 
 
-def check_stop_loss(entry_price, current_price, latest_second_deriv):
+def calculate_atr(df, period=ATR_PERIOD):
+    """
+    计算ATR（平均真实波幅），衡量这只股票的正常波动幅度
+    """
+    high = df["最高"]
+    low = df["最低"]
+    prev_close = df["收盘"].shift(1)
+
+    range1 = high - low
+    range2 = (high - prev_close).abs()
+    range3 = (low - prev_close).abs()
+
+    true_range = pd.concat([range1, range2, range3], axis=1).max(axis=1)
+    atr = true_range.rolling(window=period).mean()
+
+    return atr
+
+
+def check_stop_loss(entry_price, current_price, latest_second_deriv, atr_value):
     loss_percent = (entry_price - current_price) / entry_price * 100
+
+    dynamic_stop_loss_percent = (atr_value * ATR_MULTIPLIER) / entry_price * 100
+
     messages = []
 
-    if loss_percent >= STOP_LOSS_PERCENT:
-        messages.append((f"触发止损：当前亏损 {loss_percent:.2f}%，已达到设定止损线 {STOP_LOSS_PERCENT}%", "error"))
+    messages.append((f"该股票近期波动率(ATR)对应的动态止损线约为: {dynamic_stop_loss_percent:.2f}%（ATR×{ATR_MULTIPLIER}）", "info"))
+
+    if loss_percent >= dynamic_stop_loss_percent:
+        messages.append((f"触发止损：当前亏损 {loss_percent:.2f}%，已超过该股票的动态止损线 {dynamic_stop_loss_percent:.2f}%，建议考虑止损离场", "error"))
     elif loss_percent > 0:
-        messages.append((f"当前浮亏 {loss_percent:.2f}%，尚未达到止损线（{STOP_LOSS_PERCENT}%）", "warning"))
+        messages.append((f"当前浮亏 {loss_percent:.2f}%，尚未达到动态止损线（{dynamic_stop_loss_percent:.2f}%），继续观察", "warning"))
     else:
         messages.append((f"当前浮盈 {-loss_percent:.2f}%，暂无亏损", "success"))
 
@@ -262,6 +277,8 @@ if analyze_button:
             df["稳健_一阶导"] = df["稳健_平滑价"].diff()
             df["稳健_二阶导"] = df["稳健_一阶导"].diff()
 
+            df["ATR"] = calculate_atr(df)
+
             latest = df.iloc[-1]
             prev = df.iloc[-2]
 
@@ -321,14 +338,15 @@ if analyze_button:
                 try:
                     entry_price = float(entry_price_input)
                     st.markdown(f"### 止损检查（假设买入价: {entry_price}）")
-                    stop_messages = check_stop_loss(entry_price, latest["收盘"], latest["稳健_二阶导"])
+                    latest_atr = df["ATR"].iloc[-1]
+                    stop_messages = check_stop_loss(entry_price, latest["收盘"], latest["稳健_二阶导"], latest_atr)
                     for msg, level in stop_messages:
                         show_message(msg, level)
                 except ValueError:
                     st.error("买入价格格式不正确，已跳过止损检查")
 
             with st.expander("查看最近10天详细数据"):
-                display_cols = ["日期", "收盘", "成交量", "灵敏_一阶导", "灵敏_二阶导", "稳健_一阶导", "稳健_二阶导"]
+                display_cols = ["日期", "收盘", "成交量", "灵敏_一阶导", "灵敏_二阶导", "稳健_一阶导", "稳健_二阶导", "ATR"]
                 display_df = df[display_cols].tail(10).rename(columns={
                     "灵敏_一阶导": "灵敏_动量",
                     "灵敏_二阶导": "灵敏_曲率",
