@@ -5,6 +5,7 @@ import pandas as pd
 from scipy.signal import savgol_filter
 from datetime import datetime, timedelta
 import time
+import json
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
@@ -17,11 +18,122 @@ window_length = 11
 polyorder = 3
 STOP_LOSS_PERCENT = 8.0
 
+USERS_FILE = "users.json"
+
+
+# ========== 账户系统 ==========
+
+def load_users():
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_users(users):
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=4)
+
+
+def check_login(username, password):
+    users = load_users()
+    if username in users and users[username]["password"] == password:
+        return users[username]
+    return None
+
+
+def login_page():
+    st.title("登录")
+    username = st.text_input("用户名")
+    password = st.text_input("密码", type="password")
+    login_button = st.button("登录", type="primary")
+
+    if login_button:
+        user_info = check_login(username, password)
+        if user_info:
+            st.session_state["logged_in"] = True
+            st.session_state["username"] = username
+            st.session_state["role"] = user_info["role"]
+            st.session_state["display_name"] = user_info["display_name"]
+            st.rerun()
+        else:
+            st.error("用户名或密码错误")
+
+
+# ========== 数据获取（含主备数据源切换）==========
+
+def get_stock_code_with_prefix(stock_code):
+    """
+    根据股票代码判断交易所前缀（沪市sh/深市sz），腾讯接口需要这个前缀
+    """
+    if stock_code.startswith("6"):
+        return "sh" + stock_code
+    else:
+        return "sz" + stock_code
+
+
+def get_data_from_eastmoney(stock_code, start_date, end_date):
+    """
+    主数据源：东方财富
+    """
+    df = ak.stock_zh_a_hist(
+        symbol=stock_code,
+        period="daily",
+        start_date=start_date,
+        end_date=end_date,
+        adjust="qfq"
+    )
+    return df
+
+
+def get_data_from_tencent(stock_code, start_date, end_date):
+    """
+    备用数据源：腾讯财经
+    返回的列名和东方财富不同，这里统一"翻译"成一样的格式
+    """
+    prefixed_code = get_stock_code_with_prefix(stock_code)
+    df = ak.stock_zh_a_hist_tx(symbol=prefixed_code)
+
+    df = df.rename(columns={
+        "date": "日期",
+        "open": "开盘",
+        "close": "收盘",
+        "high": "最高",
+        "low": "最低",
+        "amount": "成交量"
+    })
+
+    df["日期"] = pd.to_datetime(df["日期"])
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date)
+    df = df[(df["日期"] >= start) & (df["日期"] <= end)]
+    df["日期"] = df["日期"].dt.strftime("%Y-%m-%d")
+
+    return df
+
+
+def get_stock_data_with_retry(stock_code, start_date, end_date, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            df = get_data_from_eastmoney(stock_code, start_date, end_date)
+            return df, "东方财富"
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(3 * (attempt + 1))
+
+    for attempt in range(max_retries):
+        try:
+            df = get_data_from_tencent(stock_code, start_date, end_date)
+            return df, "腾讯财经（备用源）"
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(3 * (attempt + 1))
+
+    return None, None
+
 
 def get_stock_name(stock_code):
-    """
-    根据股票代码查询股票名称
-    """
     try:
         name_df = ak.stock_info_a_code_name()
         result = name_df[name_df["code"] == stock_code]
@@ -32,23 +144,7 @@ def get_stock_name(stock_code):
         return None
 
 
-def get_stock_data_with_retry(stock_code, start_date, end_date, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq"
-            )
-            return df
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(3 * (attempt + 1))
-            else:
-                return None
-
+# ========== 信号判断逻辑 ==========
 
 def judge_signal(prev_first, latest_first, latest_second):
     if prev_first < 0 and latest_first > 0:
@@ -115,6 +211,18 @@ def show_message(text, level):
 
 st.set_page_config(page_title="A股动量曲率分析", layout="wide")
 
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+
+if not st.session_state["logged_in"]:
+    login_page()
+    st.stop()
+
+st.sidebar.write(f"当前登录用户：{st.session_state['display_name']}（{st.session_state['role']}）")
+if st.sidebar.button("退出登录"):
+    st.session_state["logged_in"] = False
+    st.rerun()
+
 st.title("A股K线动量与曲率分析工具")
 st.caption("基于动量（价格变化速度）、曲率（价格变化的弯曲程度）与成交量的技术面参考工具，仅供学习研究使用，不构成投资建议")
 st.warning("⚠️ 免责声明：本工具基于历史价格数据的技术指标计算，仅用于技术学习交流，不构成任何投资建议。股市有风险，入市需谨慎，一切投资决策及后果由使用者自行承担。开发者不对因使用本工具产生的任何损失负责。")
@@ -135,11 +243,14 @@ if analyze_button:
             stock_name = get_stock_name(stock_code)
             end_date = datetime.now().strftime("%Y%m%d")
             start_date = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
-            df = get_stock_data_with_retry(stock_code, start_date, end_date)
+            df, data_source = get_stock_data_with_retry(stock_code, start_date, end_date)
 
         if df is None or len(df) < 30:
             st.error("获取数据失败，或数据量不足，请检查股票代码是否正确，或稍后重试")
         else:
+            if data_source == "腾讯财经（备用源）":
+                st.info(f"提示：主数据源暂时不可用，已自动切换到 {data_source} 获取数据")
+
             df = df.sort_values("日期").reset_index(drop=True)
             close_prices = df["收盘"].values
 
@@ -157,7 +268,6 @@ if analyze_button:
             display_name = f"{stock_name}（{stock_code}）" if stock_name else stock_code
             st.subheader(f"{display_name}　最新交易日: {latest['日期']}　最新收盘价: {latest['收盘']}")
 
-            # ----- 图表 -----
             fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
             dates = df["日期"].tail(60)
 
@@ -183,7 +293,6 @@ if analyze_button:
             plt.tight_layout()
             st.pyplot(fig)
 
-            # ----- 信号判断 -----
             st.markdown("### 信号判断")
 
             c1, c2 = st.columns(2)
