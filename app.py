@@ -8,6 +8,7 @@ import time
 import json
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
+import mplfinance as mpf
 
 font_path = "fonts/SimHei.ttf"
 fm.fontManager.addfont(font_path)
@@ -172,9 +173,6 @@ def check_volume_confirmation(df):
 
 
 def calculate_atr(df, period=ATR_PERIOD):
-    """
-    计算ATR（平均真实波幅），衡量这只股票的正常波动幅度
-    """
     high = df["最高"]
     low = df["最低"]
     prev_close = df["收盘"].shift(1)
@@ -191,11 +189,9 @@ def calculate_atr(df, period=ATR_PERIOD):
 
 def check_stop_loss(entry_price, current_price, latest_second_deriv, atr_value):
     loss_percent = (entry_price - current_price) / entry_price * 100
-
     dynamic_stop_loss_percent = (atr_value * ATR_MULTIPLIER) / entry_price * 100
 
     messages = []
-
     messages.append((f"该股票近期波动率(ATR)对应的动态止损线约为: {dynamic_stop_loss_percent:.2f}%（ATR×{ATR_MULTIPLIER}）", "info"))
 
     if loss_percent >= dynamic_stop_loss_percent:
@@ -285,30 +281,73 @@ if analyze_button:
             display_name = f"{stock_name}（{stock_code}）" if stock_name else stock_code
             st.subheader(f"{display_name}　最新交易日: {latest['日期']}　最新收盘价: {latest['收盘']}")
 
-            fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+            # ===== 蜡烛图 =====
+            try:
+                plot_df = df.tail(60).copy()
+                plot_df["日期"] = pd.to_datetime(plot_df["日期"])
+                plot_df = plot_df.set_index("日期")
+                plot_df = plot_df.rename(columns={
+                    "开盘": "Open",
+                    "最高": "High",
+                    "最低": "Low",
+                    "收盘": "Close",
+                    "成交量": "Volume"
+                })
+                plot_df = plot_df[["Open", "High", "Low", "Close", "Volume", "稳健_平滑价"]].dropna()
+
+                ema_line = mpf.make_addplot(
+                    plot_df["稳健_平滑价"],
+                    color="blue",
+                    width=1.2
+                )
+
+                mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
+                s = mpf.make_mpf_style(marketcolors=mc, base_mpf_style='yahoo', rc={'font.family': 'SimHei'})
+
+                fig, axlist = mpf.plot(
+                    plot_df,
+                    type='candle',
+                    addplot=ema_line,
+                    style=s,
+                    volume=True,
+                    returnfig=True,
+                    figsize=(12, 6),
+                    title="K线走势（最近60个交易日，红涨绿跌）",
+                    ylabel="价格",
+                    ylabel_lower="成交量",
+                    datetime_format="%Y-%m-%d",
+                    xrotation=45
+                )
+                st.pyplot(fig)
+            except Exception as e:
+                st.warning(f"蜡烛图绘制失败，改用折线图展示：{e}")
+                fig_fallback, ax_fallback = plt.subplots(figsize=(12, 4))
+                ax_fallback.plot(df["日期"].tail(60), df["收盘"].tail(60), label="收盘价", color="blue")
+                ax_fallback.set_title("价格走势（最近60个交易日）")
+                ax_fallback.legend()
+                ax_fallback.grid(True)
+                plt.xticks(rotation=45)
+                st.pyplot(fig_fallback)
+
+            # ===== 动量、曲率单独用折线图展示 =====
+            fig2, axes2 = plt.subplots(2, 1, figsize=(12, 5), sharex=True)
             dates = df["日期"].tail(60)
 
-            axes[0].plot(dates, df["收盘"].tail(60), label="原始收盘价", alpha=0.4, color="gray")
-            axes[0].plot(dates, df["稳健_平滑价"].tail(60), label="稳健平滑价(EMA)", color="blue")
-            axes[0].set_title("价格走势（最近60个交易日）")
-            axes[0].legend()
-            axes[0].grid(True)
+            axes2[0].plot(dates, df["稳健_一阶导"].tail(60), color="green")
+            axes2[0].axhline(0, color="black", linewidth=0.8, linestyle="--")
+            axes2[0].set_title("动量（稳健版EMA）")
+            axes2[0].grid(True)
 
-            axes[1].plot(dates, df["稳健_一阶导"].tail(60), color="green")
-            axes[1].axhline(0, color="black", linewidth=0.8, linestyle="--")
-            axes[1].set_title("动量（稳健版EMA）")
-            axes[1].grid(True)
-
-            axes[2].plot(dates, df["稳健_二阶导"].tail(60), color="red")
-            axes[2].axhline(0, color="black", linewidth=0.8, linestyle="--")
-            axes[2].set_title("曲率（稳健版EMA）")
-            axes[2].grid(True)
+            axes2[1].plot(dates, df["稳健_二阶导"].tail(60), color="red")
+            axes2[1].axhline(0, color="black", linewidth=0.8, linestyle="--")
+            axes2[1].set_title("曲率（稳健版EMA）")
+            axes2[1].grid(True)
 
             plt.xticks(rotation=45)
             step = max(len(dates) // 10, 1)
-            axes[2].set_xticks(dates[::step])
+            axes2[1].set_xticks(dates[::step])
             plt.tight_layout()
-            st.pyplot(fig)
+            st.pyplot(fig2)
 
             st.markdown("### 信号判断")
 
