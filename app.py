@@ -106,6 +106,32 @@ def get_data_from_tencent(stock_code, start_date, end_date):
     return df
 
 
+def get_data_from_sina(stock_code, start_date, end_date):
+    """
+    第三备用数据源：新浪财经
+    """
+    prefixed_code = get_stock_code_with_prefix(stock_code)
+    df = ak.stock_zh_a_daily(symbol=prefixed_code)
+
+    df = df.reset_index()
+    df = df.rename(columns={
+        "date": "日期",
+        "open": "开盘",
+        "close": "收盘",
+        "high": "最高",
+        "low": "最低",
+        "volume": "成交量"
+    })
+
+    df["日期"] = pd.to_datetime(df["日期"])
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date)
+    df = df[(df["日期"] >= start) & (df["日期"] <= end)]
+    df["日期"] = df["日期"].dt.strftime("%Y-%m-%d")
+
+    return df
+
+
 def get_stock_data_with_retry(stock_code, start_date, end_date, max_retries=3):
     for attempt in range(max_retries):
         try:
@@ -119,6 +145,14 @@ def get_stock_data_with_retry(stock_code, start_date, end_date, max_retries=3):
         try:
             df = get_data_from_tencent(stock_code, start_date, end_date)
             return df, "腾讯财经（备用源）"
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(3 * (attempt + 1))
+
+    for attempt in range(max_retries):
+        try:
+            df = get_data_from_sina(stock_code, start_date, end_date)
+            return df, "新浪财经（备用源）"
         except Exception:
             if attempt < max_retries - 1:
                 time.sleep(3 * (attempt + 1))
@@ -242,52 +276,85 @@ def get_capital_conclusion(stock_code):
 
 # ========== 技术面信号判断 ==========
 
-def judge_signal(prev_first, latest_first, latest_second):
+def evaluate_version_conclusion(prev_first, latest_first, prev_second, latest_second):
+    """
+    对单一版本（灵敏版 或 稳健版）给出 买入/观望/卖出 结论。
+    逻辑基于物理中位移-速度-加速度的关系，动量(一阶导)和曲率(二阶导)组合判断，而非只看动量单一指标：
+
+    - 强买入（波谷已过）：动量由负转正 —— 已经越过波谷拐点，确认反转
+    - 早期买入（接近波谷）：动量为负、曲率也为负，但两者都在向0靠拢（跌势正在减速，尚未反转但正在触底）
+    - 强卖出（波峰已过）：动量由正转负 —— 已经越过波峰拐点，确认见顶
+    - 早期卖出（接近波峰）：动量为正、曲率也为正，但两者都在向0靠拢（涨势正在减速，尚未转跌但动能耗尽）
+    - 其他情况：观望
+    """
+    # 强买入：已越过波谷
     if prev_first < 0 and latest_first > 0:
-        return "潜在买入信号：动量由负转正，短期趋势可能由跌转涨", "success"
-    elif latest_first > 0 and latest_second < 0:
-        return "注意：价格仍在上涨，但曲率转负，上涨动能可能正在减弱", "warning"
-    elif latest_first < 0:
-        return "无买入信号：当前动量为负，价格仍处于下跌趋势", "error"
-    else:
-        return "观察中：暂无明显的拐点信号", "info"
+        return "买入", "动量已由负转正，价格已越过波谷拐点，是确认性的买入信号"
+
+    # 强卖出：已越过波峰
+    if prev_first > 0 and latest_first < 0:
+        return "卖出", "动量已由正转负，价格已越过波峰拐点，是确认性的卖出信号"
+
+    # 早期买入：动量、曲率同为负值，且都在向0靠拢（跌势减速，接近波谷）
+    if latest_first < 0 and latest_second < 0 and latest_second > prev_second and latest_first > prev_first:
+        return "买入", "动量与曲率均为负值，但都在向0靠拢，跌势正在减速，接近波谷，属于提前信号"
+
+    # 早期卖出：动量、曲率同为正值，且都在向0靠拢（涨势减速，接近波峰）
+    if latest_first > 0 and latest_second > 0 and latest_second < prev_second and latest_first < prev_first:
+        return "卖出", "动量与曲率均为正值，但都在向0靠拢，涨势正在减速，接近波峰，属于提前信号"
+
+    return "观望", "动量与曲率未呈现明显的波峰/波谷趋势特征，暂不具备明确的买卖依据"
 
 
-def get_technical_conclusion(prev_first, latest_first, latest_second, is_stop_loss_triggered=False):
+def combine_version_conclusions(sensitive_conclusion, robust_conclusion):
+    """
+    合并灵敏版与稳健版各自的结论，得到统一的技术面结论
+    规则：只要有一个版本给出买入/卖出，且另一个版本不是相反方向，就采纳；
+    若两个版本方向相反（一个买入一个卖出），判定为观望并提示矛盾
+    """
+    if sensitive_conclusion == robust_conclusion:
+        return sensitive_conclusion, False  # 两版本一致，无矛盾
+
+    if {"买入", "卖出"} == {sensitive_conclusion, robust_conclusion}:
+        return "观望", True  # 两版本方向相反，矛盾
+
+    # 一个是买入/卖出，另一个是观望 -> 采纳非观望的那个
+    if sensitive_conclusion != "观望":
+        return sensitive_conclusion, False
+    if robust_conclusion != "观望":
+        return robust_conclusion, False
+
+    return "观望", False
+
+
+def get_technical_conclusion(sensitive_prev_first, sensitive_latest_first, sensitive_prev_second, sensitive_latest_second,
+                              robust_prev_first, robust_latest_first, robust_prev_second, robust_latest_second,
+                              is_stop_loss_triggered=False):
     """
     技术面结论：买入 / 观望 / 卖出
-    逻辑类似物理中的位移-速度-加速度关系：
-    - 动量(一阶导)由负转正 = 波谷拐点，是买入时机；若曲率(二阶导)同时为正，说明确实在加速向上，信号更强
-    - 动量由正转负 = 波峰拐点，是卖出/止盈时机
-    - 已触发止损线，直接判定卖出
+    分别对灵敏版、稳健版计算各自结论，再合并成统一的技术面结论
     """
     if is_stop_loss_triggered:
-        return "卖出", "error", ["已触发止损线，建议考虑离场，控制风险"]
+        return "卖出", "error", ["已触发止损线，建议考虑离场，控制风险"], "-", "-"
 
-    reasons = []
+    sensitive_conclusion, sensitive_reason = evaluate_version_conclusion(
+        sensitive_prev_first, sensitive_latest_first, sensitive_prev_second, sensitive_latest_second
+    )
+    robust_conclusion, robust_reason = evaluate_version_conclusion(
+        robust_prev_first, robust_latest_first, robust_prev_second, robust_latest_second
+    )
 
-    if prev_first < 0 and latest_first > 0:
-        if latest_second > 0:
-            reasons.append("动量由负转正，且曲率为正，符合“波谷”特征，是相对理想的买入时机")
-            return "买入", "success", reasons
-        else:
-            reasons.append("动量刚由负转正，但曲率尚未转正，拐点信号还不够扎实，建议谨慎小仓位观察")
-            return "观望", "warning", reasons
+    final_conclusion, is_conflict = combine_version_conclusions(sensitive_conclusion, robust_conclusion)
 
-    if prev_first > 0 and latest_first < 0:
-        reasons.append("动量由正转负，符合“波峰”特征，上涨动能已经耗尽，建议考虑卖出/止盈")
-        return "卖出", "error", reasons
+    level_map = {"买入": "success", "卖出": "error", "观望": "info"}
+    level = level_map[final_conclusion]
 
-    if latest_first < 0:
-        reasons.append("当前动量为负，价格仍处于下跌趋势中，暂无买入依据")
-        return "观望", "error", reasons
+    reasons = [f"灵敏版：{sensitive_reason}", f"稳健版：{robust_reason}"]
+    if is_conflict:
+        reasons.append("两个版本结论方向相反，存在分歧，建议谨慎观望")
+        level = "warning"
 
-    if latest_first > 0 and latest_second < 0:
-        reasons.append("价格仍在上涨，但曲率已转负，上涨动能正在减弱，需警惕见顶风险")
-        return "观望", "warning", reasons
-
-    reasons.append("暂无明显拐点信号，趋势不够清晰")
-    return "观望", "info", reasons
+    return final_conclusion, level, reasons, sensitive_conclusion, robust_conclusion
 
 
 def get_overall_conclusion(technical_conclusion, capital_conclusion):
@@ -400,6 +467,190 @@ def render_conclusion_box(title, conclusion, level, reason_text):
     )
 
 
+# ========== 智能推荐功能 ==========
+
+RECOMMEND_CACHE_FILE = "recommend_cache.json"
+RECOMMEND_SCAN_POOL_SIZE = 300
+RECOMMEND_TARGET_COUNT = 5
+RECOMMEND_VALID_HOURS = 3
+
+
+def load_recommend_cache():
+    try:
+        with open(RECOMMEND_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_recommend_cache(data):
+    try:
+        with open(RECOMMEND_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception:
+        pass
+
+
+def is_cache_valid(cache):
+    """
+    缓存只有在“上次成功凑够目标数量”的前提下，才受3小时冷却限制。
+    如果上次结果不完整（数量不足5只），视为无效缓存，允许随时重新扫描。
+    """
+    if cache is None or "timestamp" not in cache or "results" not in cache:
+        return False
+
+    if len(cache["results"]) < RECOMMEND_TARGET_COUNT:
+        return False
+
+    cache_time = datetime.fromisoformat(cache["timestamp"])
+    elapsed_hours = (datetime.now() - cache_time).total_seconds() / 3600
+    return elapsed_hours < RECOMMEND_VALID_HOURS
+
+
+def get_candidate_pool(max_retries=3):
+    """
+    获取全市场股票快照，按价格升序排序（优先低价股，但绝不排除任何价格区间的股票）
+    主数据源：东方财富；失败则切换到备用源：新浪财经
+    返回排序后的完整DataFrame，包含代码、名称、最新价（代码统一为不带交易所前缀的纯数字格式）
+    """
+    spot_df = None
+    source_used = None
+
+    # ===== 主数据源：东方财富 =====
+    for attempt in range(max_retries):
+        try:
+            spot_df = ak.stock_zh_a_spot_em()
+            spot_df = spot_df[["代码", "名称", "最新价"]].dropna()
+            source_used = "东方财富"
+            break
+        except Exception:
+            spot_df = None
+            if attempt < max_retries - 1:
+                time.sleep(3 * (attempt + 1))
+
+    # ===== 备用数据源：新浪财经 =====
+    if spot_df is None:
+        for attempt in range(max_retries):
+            try:
+                sina_df = ak.stock_zh_a_spot()
+                sina_df = sina_df[["代码", "名称", "最新价"]].dropna()
+                # 新浪返回的代码带交易所前缀（sh/sz/bj），统一去除前缀，只保留纯数字部分
+                sina_df["代码"] = sina_df["代码"].str.replace(r"^[a-zA-Z]+", "", regex=True)
+                spot_df = sina_df
+                source_used = "新浪财经（备用源）"
+                break
+            except Exception:
+                spot_df = None
+                if attempt < max_retries - 1:
+                    time.sleep(3 * (attempt + 1))
+
+    if spot_df is None:
+        return pd.DataFrame(columns=["代码", "名称", "最新价"])
+
+    spot_df = spot_df[spot_df["最新价"] > 0]
+    # 按价格升序排序：低价股（尤其10元、20元以内）优先被扫描到，但不设置任何价格上限排除
+    spot_df = spot_df.sort_values("最新价", ascending=True).reset_index(drop=True)
+    return spot_df
+
+
+def scan_for_recommendations(progress_callback=None):
+    """
+    扫描候选股票池（按价格从低到高排序），找出灵敏版或稳健版任一出现买入信号的股票。
+    优先扫描前RECOMMEND_SCAN_POOL_SIZE只（价格最低的一批），如果不够目标数量，
+    继续向后扩大扫描范围（不排除任何价格区间），直到凑够目标数量或达到硬性扫描上限。
+    progress_callback: 可选的回调函数，用于更新进度提示，接收(当前扫描数, 预计总数, 已找到数)
+    """
+    all_candidates = get_candidate_pool()
+
+    if all_candidates.empty:
+        return []
+
+    found = []
+    max_scan_limit = len(all_candidates)  # 不设硬性上限，扫描全市场直到凑够目标数量为止
+
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
+
+    for i in range(max_scan_limit):
+        row = all_candidates.iloc[i]
+        code = row["代码"]
+        name = row["名称"]
+
+        # 进度显示：优先按预期的RECOMMEND_SCAN_POOL_SIZE估算，超出后按当前扩展范围显示
+        estimated_total = max(RECOMMEND_SCAN_POOL_SIZE, i + 1)
+        if progress_callback:
+            progress_callback(i + 1, estimated_total, len(found))
+
+        if len(found) >= RECOMMEND_TARGET_COUNT:
+            break
+
+        df, source = get_stock_data_with_retry(code, start_date, end_date, max_retries=1)
+        if df is None or len(df) < 30:
+            continue
+
+        try:
+            df = df.sort_values("日期").reset_index(drop=True)
+            close_prices = df["收盘"].values
+
+            sensitive_first = savgol_filter(close_prices, window_length, polyorder, deriv=1)
+            sensitive_second = savgol_filter(close_prices, window_length, polyorder, deriv=2)
+
+            df["稳健_平滑价"] = df["收盘"].ewm(span=10, adjust=False).mean()
+            df["稳健_一阶导"] = df["稳健_平滑价"].diff()
+            df["稳健_二阶导"] = df["稳健_一阶导"].diff()
+
+            latest_close = df["收盘"].iloc[-1]
+
+            # 灵敏版判断：动量+曲率组合（含波谷确认与提前信号）
+            sensitive_conclusion, _ = evaluate_version_conclusion(
+                sensitive_first[-2], sensitive_first[-1], sensitive_second[-2], sensitive_second[-1]
+            )
+
+            # 稳健版判断：动量+曲率组合（含波谷确认与提前信号）
+            robust_first = df["稳健_一阶导"].values
+            robust_second = df["稳健_二阶导"].values
+            robust_conclusion, _ = evaluate_version_conclusion(
+                robust_first[-2], robust_first[-1], robust_second[-2], robust_second[-1]
+            )
+
+            sensitive_buy = sensitive_conclusion == "买入"
+            robust_buy = robust_conclusion == "买入"
+
+            if sensitive_buy or robust_buy:
+                if sensitive_buy and robust_buy:
+                    version_label = "灵敏版+稳健版均触发"
+                elif sensitive_buy:
+                    version_label = "灵敏版触发"
+                else:
+                    version_label = "稳健版触发"
+
+                found.append({
+                    "代码": code,
+                    "名称": name,
+                    "最新价": round(float(latest_close), 2),
+                    "触发版本": version_label
+                })
+        except Exception:
+            continue
+
+        time.sleep(0.3)
+
+    return found
+
+
+def get_recommendations(force_refresh=False):
+    """
+    获取推荐结果：优先使用3小时内的缓存，否则重新扫描
+    返回：(结果列表, 是否为缓存结果, 缓存时间字符串或None)
+    """
+    cache = load_recommend_cache()
+
+    if not force_refresh and is_cache_valid(cache):
+        return cache["results"], True, cache["timestamp"]
+
+    return None, False, None
+
+
 # ========== 网页界面开始 ==========
 
 st.set_page_config(page_title="A股动量曲率分析", layout="wide")
@@ -441,7 +692,7 @@ if analyze_button:
         if df is None or len(df) < 30:
             st.error("获取数据失败，或数据量不足，请检查股票代码是否正确，或稍后重试")
         else:
-            if data_source == "腾讯财经（备用源）":
+            if data_source != "东方财富":
                 st.info(f"提示：主数据源暂时不可用，已自动切换到 {data_source} 获取数据")
 
             df = df.sort_values("日期").reset_index(drop=True)
@@ -474,17 +725,18 @@ if analyze_button:
                 except ValueError:
                     entry_price = None
 
-            # ===== 结论1：技术面结论（自动显示，速度快）=====
-            technical_conclusion, technical_level, technical_reasons = get_technical_conclusion(
-                prev["稳健_一阶导"], latest["稳健_一阶导"], latest["稳健_二阶导"], is_stop_loss_triggered
+            # ===== 计算灵敏版、稳健版各自结论（不单独展示合并后的"技术面结论"）=====
+            _, _, _, sensitive_ver_conclusion, robust_ver_conclusion = get_technical_conclusion(
+                prev["灵敏_一阶导"], latest["灵敏_一阶导"], prev["灵敏_二阶导"], latest["灵敏_二阶导"],
+                prev["稳健_一阶导"], latest["稳健_一阶导"], prev["稳健_二阶导"], latest["稳健_二阶导"]
             )
 
-            st.markdown("### 技术面结论（动量+曲率）")
-            render_conclusion_box("技术面结论", technical_conclusion, technical_level, "；".join(technical_reasons))
+            if is_stop_loss_triggered:
+                st.error("已触发止损线，建议考虑离场，控制风险")
 
-            # ===== 资金面结论：改为手动触发，避免拖慢默认分析速度 =====
-            st.markdown("### 资金面结论（可选，需单独查询）")
-            st.caption("股东增减持公告与北向资金查询耗时较长，默认不自动执行，点击下方按钮才会查询")
+            # ===== 资金面结论：手动触发查询，查询完成后与灵敏版、稳健版结论一起展示 =====
+            st.markdown("### 查询资金面数据")
+            st.caption("股东增减持公告与北向资金查询耗时较长，默认不自动执行，点击下方按钮后，将与灵敏版、稳健版技术面结论一起展示")
 
             capital_button = st.button("查询资金面数据（股东增减持 + 北向资金）", key=f"capital_btn_{stock_code}")
 
@@ -498,13 +750,22 @@ if analyze_button:
             if capital_cache_key in st.session_state:
                 capital_conclusion, capital_level, capital_details = st.session_state[capital_cache_key]
 
-                overall_conclusion, overall_level, overall_reason = get_overall_conclusion(technical_conclusion, capital_conclusion)
+                _, sensitive_reason_box = evaluate_version_conclusion(
+                    prev["灵敏_一阶导"], latest["灵敏_一阶导"], prev["灵敏_二阶导"], latest["灵敏_二阶导"]
+                )
+                _, robust_reason_box = evaluate_version_conclusion(
+                    prev["稳健_一阶导"], latest["稳健_一阶导"], prev["稳健_二阶导"], latest["稳健_二阶导"]
+                )
+                level_map_box = {"买入": "success", "卖出": "error", "观望": "info", "-": "error"}
 
-                col_b, col_c = st.columns(2)
+                st.markdown("### 三项结论一览（灵敏版 / 稳健版 / 资金面）")
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    render_conclusion_box("灵敏版结论（Savitzky-Golay）", sensitive_ver_conclusion, level_map_box[sensitive_ver_conclusion], sensitive_reason_box)
                 with col_b:
-                    render_conclusion_box("资金面结论（股东+北向资金）", capital_conclusion, capital_level, "；".join(capital_details))
+                    render_conclusion_box("稳健版结论（EMA）", robust_ver_conclusion, level_map_box[robust_ver_conclusion], robust_reason_box)
                 with col_c:
-                    render_conclusion_box("综合结论", overall_conclusion, overall_level, overall_reason)
+                    render_conclusion_box("资金面结论（股东+北向资金）", capital_conclusion, capital_level, "；".join(capital_details))
 
             st.caption("以上结论仅基于历史数据与公开信息的规则计算，不构成投资建议，最终决策请结合自身判断")
 
@@ -576,26 +837,6 @@ if analyze_button:
             plt.tight_layout()
             st.pyplot(fig2)
 
-            st.markdown("### 信号判断（详细版）")
-
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**方法A：灵敏版 Savitzky-Golay**")
-                st.write(f"动量: {latest['灵敏_一阶导']:.2f}　曲率: {latest['灵敏_二阶导']:.2f}")
-                msg_a, level_a = judge_signal(prev["灵敏_一阶导"], latest["灵敏_一阶导"], latest["灵敏_二阶导"])
-                show_message(msg_a, level_a)
-
-            with c2:
-                st.markdown("**方法B：稳健版 EMA**")
-                st.write(f"动量: {latest['稳健_一阶导']:.2f}　曲率: {latest['稳健_二阶导']:.2f}")
-                msg_b, level_b = judge_signal(prev["稳健_一阶导"], latest["稳健_一阶导"], latest["稳健_二阶导"])
-                show_message(msg_b, level_b)
-
-            if msg_a == msg_b:
-                st.success("两种方法结论一致，信号可信度相对更高")
-            else:
-                st.warning("两种方法结论不一致，当前处于趋势转折的模糊地带，建议谨慎观望")
-
             st.markdown("### 成交量验证")
             vol_msg, vol_level = check_volume_confirmation(df)
             show_message(vol_msg, vol_level)
@@ -652,7 +893,7 @@ if batch_button:
             if len(code) != 6:
                 results_table.append({
                     "代码": code, "名称": "-", "最新价": "-",
-                    "技术面结论": "代码格式错误", "曲率": "-", "成交量": "-"
+                    "灵敏版结论": "代码格式错误", "稳健版结论": "-", "成交量": "-"
                 })
                 progress_bar.progress((i + 1) / len(codes))
                 continue
@@ -665,12 +906,16 @@ if batch_button:
             if b_df is None or len(b_df) < 30:
                 results_table.append({
                     "代码": code, "名称": b_name if b_name else "-", "最新价": "-",
-                    "技术面结论": "数据获取失败", "曲率": "-", "成交量": "-"
+                    "灵敏版结论": "数据获取失败", "稳健版结论": "-", "成交量": "-"
                 })
                 progress_bar.progress((i + 1) / len(codes))
                 continue
 
             b_df = b_df.sort_values("日期").reset_index(drop=True)
+            b_close_prices = b_df["收盘"].values
+
+            b_df["灵敏_一阶导"] = savgol_filter(b_close_prices, window_length, polyorder, deriv=1)
+            b_df["灵敏_二阶导"] = savgol_filter(b_close_prices, window_length, polyorder, deriv=2)
 
             b_df["稳健_平滑价"] = b_df["收盘"].ewm(span=10, adjust=False).mean()
             b_df["稳健_一阶导"] = b_df["稳健_平滑价"].diff()
@@ -679,8 +924,11 @@ if batch_button:
             b_latest = b_df.iloc[-1]
             b_prev = b_df.iloc[-2]
 
-            b_technical, b_tech_level, _ = get_technical_conclusion(
-                b_prev["稳健_一阶导"], b_latest["稳健_一阶导"], b_latest["稳健_二阶导"]
+            sensitive_result, _ = evaluate_version_conclusion(
+                b_prev["灵敏_一阶导"], b_latest["灵敏_一阶导"], b_prev["灵敏_二阶导"], b_latest["灵敏_二阶导"]
+            )
+            robust_result, _ = evaluate_version_conclusion(
+                b_prev["稳健_一阶导"], b_latest["稳健_一阶导"], b_prev["稳健_二阶导"], b_latest["稳健_二阶导"]
             )
 
             b_vol_msg, b_vol_level = check_volume_confirmation(b_df)
@@ -693,8 +941,8 @@ if batch_button:
                 "代码": code,
                 "名称": b_name if b_name else "-",
                 "最新价": round(b_latest["收盘"], 2),
-                "技术面结论": icon_map.get(b_technical, b_technical),
-                "曲率": round(b_latest["稳健_二阶导"], 2),
+                "灵敏版结论": icon_map.get(sensitive_result, sensitive_result),
+                "稳健版结论": icon_map.get(robust_result, robust_result),
                 "成交量": vol_short
             })
 
@@ -706,3 +954,58 @@ if batch_button:
         st.dataframe(result_df, use_container_width=True, hide_index=True)
 
         st.caption("提示：批量模式仅展示核心摘要，如需查看某只股票的详细图表和止损分析，请在上方单独输入该股票代码分析")
+
+
+# ========== 智能推荐 ==========
+
+st.markdown("---")
+st.markdown("## 智能推荐（低价潜力股）")
+st.caption(f"从全市场A股中按价格从低到高排序扫描（优先10元、20元以内的低价股，但不排除任何价格区间），"
+           f"找出动量（灵敏版或稳健版任一）出现买入信号的{RECOMMEND_TARGET_COUNT}只股票。"
+           f"首批扫描约{RECOMMEND_SCAN_POOL_SIZE}只，若不够会自动扩大扫描范围，直到扫描全市场为止，确保凑够{RECOMMEND_TARGET_COUNT}只。"
+           f"只有成功凑够{RECOMMEND_TARGET_COUNT}只时，结果才会缓存{RECOMMEND_VALID_HOURS}小时（有效期内重复点击直接显示缓存）；"
+           f"若未凑够{RECOMMEND_TARGET_COUNT}只，下次点击将立即重新扫描，不受时间限制")
+
+cache_check = load_recommend_cache()
+if is_cache_valid(cache_check):
+    cache_time_obj = datetime.fromisoformat(cache_check["timestamp"])
+    remaining_minutes = int(RECOMMEND_VALID_HOURS * 60 - (datetime.now() - cache_time_obj).total_seconds() / 60)
+    st.info(f"当前有缓存结果（生成于 {cache_time_obj.strftime('%Y-%m-%d %H:%M')}），约{remaining_minutes}分钟后过期")
+
+col_r1, col_r2 = st.columns(2)
+with col_r1:
+    recommend_button = st.button("获取推荐（优先使用缓存）", type="primary")
+with col_r2:
+    force_refresh_button = st.button("强制重新扫描（忽略缓存）")
+
+if recommend_button or force_refresh_button:
+    results, is_cached, cache_timestamp = get_recommendations(force_refresh=force_refresh_button)
+
+    if is_cached:
+        st.success(f"使用缓存结果（生成于 {datetime.fromisoformat(cache_timestamp).strftime('%Y-%m-%d %H:%M')}）")
+        recommend_results = results
+    else:
+        st.warning("正在重新扫描全市场，请耐心等待（预计5-8分钟，请勿关闭页面）...")
+        progress_bar_r = st.progress(0)
+        status_text_r = st.empty()
+
+        def update_progress(current, total, found_count):
+            progress_bar_r.progress(min(current / total, 1.0))
+            status_text_r.text(f"已扫描 {current}/{total} 只，已找到 {found_count}/{RECOMMEND_TARGET_COUNT} 只符合条件的股票")
+
+        recommend_results = scan_for_recommendations(progress_callback=update_progress)
+
+        cache_data = {
+            "timestamp": datetime.now().isoformat(),
+            "results": recommend_results
+        }
+        save_recommend_cache(cache_data)
+        status_text_r.text("扫描完成")
+
+    if not recommend_results:
+        st.error("候选股票池获取失败（可能是网络波动导致全市场行情数据无法拉取），请稍等片刻后点击「强制重新扫描」重试")
+    else:
+        st.markdown(f"### 推荐结果（共{len(recommend_results)}只）")
+        recommend_df = pd.DataFrame(recommend_results)
+        st.dataframe(recommend_df, use_container_width=True, hide_index=True)
+        st.caption("以上结果仅基于动量指标的历史规则计算，不构成投资建议，具体买卖请结合上方单只股票分析做进一步确认")
