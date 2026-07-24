@@ -3,5 +3,11 @@
         "password": "admin123",
         "role": "admin",
         "display_name": "管理员"
+    },
+    "mayunda": {
+        "password": "123456",
+        "role": "user",
+        "display_name": "马运达",
+        "启用": true
     }
 }
