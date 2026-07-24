@@ -9,5 +9,11 @@
         "role": "user",
         "display_name": "马运达",
         "启用": true
+    },
+    "sy": {
+        "password": "000000",
+        "role": "user",
+        "display_name": "试用3号",
+        "启用": true
     }
 }
