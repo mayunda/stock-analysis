@@ -40,10 +40,21 @@ def save_users(users):
 
 
 def check_login(username, password):
+    """
+    返回值三种情况：
+    - (user_info, "ok")：账号密码正确且账户已启用
+    - (None, "disabled")：账号密码正确，但账户已被禁用
+    - (None, "invalid")：用户名或密码错误
+    """
     users = load_users()
     if username in users and users[username]["password"] == password:
-        return users[username]
-    return None
+        # 兼容旧数据：如果账户信息里没有"启用"这个字段，默认视为已启用
+        is_enabled = users[username].get("启用", True)
+        if is_enabled:
+            return users[username], "ok"
+        else:
+            return None, "disabled"
+    return None, "invalid"
 
 
 def login_page():
@@ -53,13 +64,15 @@ def login_page():
     login_button = st.button("登录", type="primary")
 
     if login_button:
-        user_info = check_login(username, password)
-        if user_info:
+        user_info, status = check_login(username, password)
+        if status == "ok":
             st.session_state["logged_in"] = True
             st.session_state["username"] = username
             st.session_state["role"] = user_info["role"]
             st.session_state["display_name"] = user_info["display_name"]
             st.rerun()
+        elif status == "disabled":
+            st.error("该账户已被管理员禁用，暂时无法登录")
         else:
             st.error("用户名或密码错误")
 
